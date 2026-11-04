@@ -41,6 +41,8 @@ struct Game {
     adj: Vec<Vec<usize>>,
     tris: Vec<Tri>,
     dist: Vec<Vec<u8>>,
+    /// Triangles next to each house, i.e. the ones that can attack it.
+    near: Vec<Vec<usize>>,
 }
 
 struct Input<'a> {
@@ -78,6 +80,16 @@ impl Game {
                 }
             }
         }
+    }
+
+    fn compute_near(&mut self) {
+        self.near = (0..self.n)
+            .map(|v| {
+                (0..self.tris.len())
+                    .filter(|&i| self.tris[i].c.iter().any(|&c| self.adj[c].contains(&v)))
+                    .collect()
+            })
+            .collect();
     }
 
     fn total(&self, p: usize) -> i32 {
@@ -298,6 +310,33 @@ fn evaluate(g: &Game, plan: &Plan, out: &Outcome) -> f64 {
             val -= 4.0;
         }
     }
+
+    // Best attack each side could make next turn: an owned triangle with a unit on every corner
+    // wipes an adjacent stack for 3 units and the triangle.
+    let w = weights();
+    if w.expose > 0.0 {
+        for p in [ME, OP] {
+            let q = 1 - p;
+            let mut best = 0.0f64;
+            for v in 0..n {
+                let k = out.units[q][v];
+                if k <= 3 {
+                    continue;
+                }
+                let gain = plan.unit_value * (k - 3) as f64 - w.expose_tri;
+                if gain <= best {
+                    continue;
+                }
+                let armed = g.near[v].iter().any(|&i| {
+                    out.tri_owner[i] == p as i8 && g.tris[i].c.iter().all(|&c| out.units[p][c] > 0)
+                });
+                if armed {
+                    best = gain;
+                }
+            }
+            val += if p == ME { 1.0 } else { -1.0 } * w.expose * best;
+        }
+    }
     val
 }
 
@@ -366,7 +405,7 @@ fn score_vs(
         .sum()
 }
 
-/// Chooses a destination (stay or a neighbor) for each of our units. Returns (origin, destination) per unit.
+/// Chooses a destination (stay or a neighbor) for each of our units. Returns (origin, destination) per unit and the plan's score.
 fn plan_moves(
     g: &Game,
     plan: &Plan,
@@ -375,7 +414,7 @@ fn plan_moves(
     scenarios: &[(f64, Vec<i32>)],
     rng: &mut Rng,
     budget: &mut Budget,
-) -> (Vec<usize>, Vec<usize>) {
+) -> (Vec<usize>, Vec<usize>, f64) {
     let mut origin: Vec<usize> = Vec::new();
     for v in 0..g.n {
         for _ in 0..g.units[ME][v] {
@@ -385,7 +424,15 @@ fn plan_moves(
     let mut dest = origin.clone();
     let assigned = assign_targets(g, &origin, owner, can);
     if std::env::var("CG_DEBUG").is_ok() {
-        eprintln!("origin {:?} assigned {:?} my_tris {} capturable {}", origin, assigned, owner.iter().filter(|&&o| o == ME as i8).count(), (0..g.tris.len()).filter(|&i| owner[i] != ME as i8 && can[i][ME]).count());
+        eprintln!(
+            "origin {:?} assigned {:?} my_tris {} capturable {}",
+            origin,
+            assigned,
+            owner.iter().filter(|&&o| o == ME as i8).count(),
+            (0..g.tris.len())
+                .filter(|&i| owner[i] != ME as i8 && can[i][ME])
+                .count()
+        );
     }
     let score_of = |dest: &[usize]| -> f64 {
         let mut mine = vec![0i32; g.n];
@@ -401,7 +448,7 @@ fn plan_moves(
     };
     let mut best = score_of(&dest);
     if origin.is_empty() {
-        return (origin, dest);
+        return (origin, dest, best);
     }
     // Coordinate descent, then random pair moves for coordinated captures.
     let mut improved = true;
@@ -449,23 +496,62 @@ fn plan_moves(
             dest[b] = kb;
         }
     }
-    (origin, dest)
+    (origin, dest, best)
+}
+
+/// Opponent placements to plan against: its units where they stand, and where our planner predicts they go.
+fn scenarios_for(
+    g: &Game,
+    pred_w: f64,
+    prediction: &Option<Vec<usize>>,
+) -> Vec<(f64, Vec<i32>)> {
+    let mut scenarios = vec![(1.0 - pred_w, g.units[OP].clone())];
+    if let Some(s_dest) = prediction {
+        let mut predicted = vec![0i32; g.n];
+        for &d in s_dest {
+            predicted[d] += 1;
+        }
+        scenarios.push((pred_w, predicted));
+    }
+    scenarios
+}
+
+/// The position after we attack `target` from triangle `tri`: one unit spent per corner, the target's opponent units killed.
+fn after_attack(
+    g: &Game,
+    owner: &[i8],
+    can: &[[bool; 2]],
+    tri: usize,
+    target: usize,
+) -> (Game, Vec<i8>, Vec<[bool; 2]>) {
+    let mut ng = g.clone();
+    for &c in &g.tris[tri].c {
+        ng.units[ME][c] -= 1;
+    }
+    ng.units[OP][target] = 0;
+    let mut o = owner.to_vec();
+    let mut cn = can.to_vec();
+    o[tri] = NONE;
+    cn[tri][ME] = false;
+    ng.tris[tri].owner = NONE;
+    ng.tris[tri].can[ME] = false;
+    (ng, o, cn)
 }
 
 fn play_turn(g: &mut Game, rng: &mut Rng, budget: &mut Budget) -> String {
     let mut cmds: Vec<String> = Vec::new();
     let (mut owner, mut can) = tri_state(g);
+    let mut used = vec![false; g.tris.len()];
 
     // Attacks: kill large enemy stacks next to a triangle we own with a unit on every corner.
-    let mut used = vec![false; g.tris.len()];
     for i in 0..g.tris.len() {
         let t = g.tris[i].clone();
-        if owner[i] != ME as i8 || !t.c.iter().all(|&c| g.units[ME][c] >= 1) {
+        if owner[i] != ME as i8 || t.c.iter().any(|&c| g.units[ME][c] < 1) {
             continue;
         }
         let mut best: Option<(i32, usize)> = None;
         for &c in &t.c {
-            for &w in g.adj[c].iter() {
+            for &w in &g.adj[c] {
                 let k = g.units[OP][w];
                 if k >= param("CG_ATTACK_MIN", 3) && best.map_or(true, |(bk, _)| k > bk) {
                     best = Some((k, w));
@@ -473,28 +559,18 @@ fn play_turn(g: &mut Game, rng: &mut Rng, budget: &mut Budget) -> String {
             }
         }
         if let Some((_, target)) = best {
-            for &c in &t.c {
-                g.units[ME][c] -= 1;
-            }
-            g.units[OP][target] = 0;
-            owner[i] = NONE;
-            can[i][ME] = false;
+            let (ng, o, cn) = after_attack(g, &owner, &can, i, target);
+            *g = ng;
+            owner = o;
+            can = cn;
             used[i] = true;
-            cmds.push(format!(
-                "ATTACK {} {} {} {}",
-                t.c[0], t.c[1], t.c[2], target
-            ));
+            cmds.push(format!("ATTACK {} {} {} {}", t.c[0], t.c[1], t.c[2], target));
         }
     }
 
-    // Moves: predict the opponent with our own planner from its side, then plan against a mix of
-    // where its units are now and where we expect them to go.
-    let plan = Plan {
-        target_dist: target_distances(g),
-        unit_value: 4.0,
-    };
+    // Predict the opponent with our own planner from its side.
     let pred_w = param("CG_PRED_W", 100) as f64 / 100.0;
-    let mut scenarios: Vec<(f64, Vec<i32>)> = vec![(1.0 - pred_w, g.units[OP].clone())];
+    let mut prediction = None;
     if pred_w > 0.0 {
         let (sg, s_owner, s_can) = swapped(g, &owner, &can);
         let s_plan = Plan {
@@ -503,7 +579,7 @@ fn play_turn(g: &mut Game, rng: &mut Rng, budget: &mut Budget) -> String {
         };
         let mut s_budget = budget.share(param("CG_PRED_SHARE", 33) as u64);
         let static_me = vec![(1.0, sg.units[OP].clone())];
-        let (_, s_dest) = plan_moves(
+        let (_, s_dest, _) = plan_moves(
             &sg,
             &s_plan,
             &s_owner,
@@ -512,13 +588,16 @@ fn play_turn(g: &mut Game, rng: &mut Rng, budget: &mut Budget) -> String {
             rng,
             &mut s_budget,
         );
-        let mut predicted = vec![0i32; g.n];
-        for &d in &s_dest {
-            predicted[d] += 1;
-        }
-        scenarios.push((pred_w, predicted));
+        prediction = Some(s_dest);
     }
-    let (origin, dest) = plan_moves(g, &plan, &owner, &can, &scenarios, rng, budget);
+
+    // Moves: plan against where the opponent's units are now and where we expect them to go.
+    let plan = Plan {
+        target_dist: target_distances(g),
+        unit_value: 4.0,
+    };
+    let scenarios = scenarios_for(g, pred_w, &prediction);
+    let (origin, dest, _) = plan_moves(g, &plan, &owner, &can, &scenarios, rng, budget);
 
     let mut moves: Vec<((usize, usize), i32)> = Vec::new();
     for (u, &d) in dest.iter().enumerate() {
@@ -613,6 +692,7 @@ fn main() {
         adj: vec![Vec::new(); n],
         tris: Vec::new(),
         dist: Vec::new(),
+        near: Vec::new(),
     };
     let mut rng = Rng(0x9E3779B97F4A7C15);
     let iters: Option<u64> = std::env::var("CG_ITERS").ok().and_then(|s| s.parse().ok());
@@ -652,6 +732,7 @@ fn main() {
             input.nums();
         }
         g.compute_dist();
+        g.compute_near();
         let ms = if g.turn == 0 {
             FIRST_TURN_BUDGET_MS
         } else {
@@ -663,13 +744,21 @@ fn main() {
             iters,
             used: 0,
         };
+        let status = format!(
+            "units {}-{} owned {}-{}",
+            g.total(ME),
+            g.total(OP),
+            g.tris.iter().filter(|t| t.owner == ME as i8).count(),
+            g.tris.iter().filter(|t| t.owner == OP as i8).count()
+        );
         let cmd = play_turn(&mut g, &mut rng, &mut budget);
         eprintln!(
-            "turn {} score {}-{} tris {} time {}ms",
+            "turn {} score {}-{} tris {} {} time {}ms",
             g.turn,
             g.score[0],
             g.score[1],
             g.tris.len(),
+            status,
             start.elapsed().as_millis()
         );
         let mut lock = out.lock();
@@ -691,6 +780,8 @@ fn param(name: &str, default: i32) -> i32 {
 struct Weights {
     node: f64,
     assign: f64,
+    expose: f64,
+    expose_tri: f64,
 }
 
 fn weights() -> &'static Weights {
@@ -698,5 +789,7 @@ fn weights() -> &'static Weights {
     W.get_or_init(|| Weights {
         node: param("CG_NODE_W", 10) as f64 / 10.0,
         assign: param("CG_ASSIGN_W", 20) as f64 / 10.0,
+        expose: param("CG_EXPOSE_W", 0) as f64 / 10.0,
+        expose_tri: param("CG_EXPOSE_TRI", 50) as f64 / 10.0,
     })
 }
