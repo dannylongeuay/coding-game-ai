@@ -14,6 +14,11 @@ public class LocalRunner {
         GameResult result = runner.simulate();
         String last = "";
         for (String s : result.summaries) if (s != null && !s.trim().isEmpty()) last = s.trim().replace("\n", " | ");
+        if (System.getenv("RUNNER_DEBUG") != null) {
+            System.err.println("frames " + result.summaries.size());
+            result.outputs.forEach((k, v) -> v.stream().filter(e -> e != null).limit(12).forEach(e -> System.err.println("out " + k + ": " + e.trim())));
+            result.errors.forEach((k, v) -> v.stream().filter(e -> e != null).limit(5).forEach(e -> System.err.println("error " + k + ": " + e)));
+        }
         System.out.println(seed + " " + result.scores.get(0) + " " + result.scores.get(1) + " " + last);
         System.exit(0);
     }
