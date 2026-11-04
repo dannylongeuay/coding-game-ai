@@ -170,6 +170,69 @@ struct Plan {
     unit_value: f64,
 }
 
+/// Search budget: wall-clock on CodinGame, a fixed iteration count when CG_ITERS is set (reproducible local matches).
+struct Budget {
+    start: Instant,
+    ms: u128,
+    iters: Option<u64>,
+    used: u64,
+}
+
+impl Budget {
+    fn spent(&mut self) -> bool {
+        self.used += 1;
+        match self.iters {
+            Some(limit) => self.used > limit,
+            None => self.start.elapsed().as_millis() >= self.ms,
+        }
+    }
+}
+
+/// Picks capturable triangles that free units can cover fastest and gives each chosen unit a corner to reach.
+/// A corner needs one more unit than the opponent has there.
+fn assign_targets(g: &Game, origin: &[usize], owner: &[i8], can: &[[bool; 2]]) -> Vec<Option<usize>> {
+    let mut assigned: Vec<Option<usize>> = vec![None; origin.len()];
+    let mut chosen = vec![false; g.tris.len()];
+    loop {
+        let mut best: Option<(u32, usize, Vec<(usize, usize)>)> = None;
+        for (i, t) in g.tris.iter().enumerate() {
+            if chosen[i] || owner[i] == ME as i8 || !can[i][ME] {
+                continue;
+            }
+            let mut taken: Vec<(usize, usize)> = Vec::new();
+            let mut cost = 0u32;
+            let mut ok = true;
+            for &c in &t.c {
+                for _ in 0..(g.units[OP][c] + 1) {
+                    let pick = (0..origin.len())
+                        .filter(|&u| assigned[u].is_none() && !taken.iter().any(|&(x, _)| x == u))
+                        .min_by_key(|&u| g.dist[origin[u]][c]);
+                    match pick {
+                        Some(u) => {
+                            cost = cost.max(g.dist[origin[u]][c] as u32);
+                            taken.push((u, c));
+                        }
+                        None => ok = false,
+                    }
+                }
+            }
+            if ok && best.as_ref().map_or(true, |(bc, _, _)| cost < *bc) {
+                best = Some((cost, i, taken));
+            }
+        }
+        match best {
+            Some((cost, i, taken)) if cost < 20 => {
+                chosen[i] = true;
+                for (u, c) in taken {
+                    assigned[u] = Some(c);
+                }
+            }
+            _ => break,
+        }
+    }
+    assigned
+}
+
 fn evaluate(g: &Game, plan: &Plan, out: &Outcome) -> f64 {
     let n = g.n;
     let mut val = 0.0;
@@ -190,9 +253,6 @@ fn evaluate(g: &Game, plan: &Plan, out: &Outcome) -> f64 {
             0 => val += 1.0,
             1 => val -= 1.0,
             _ => {}
-        }
-        if out.units[ME][v] > 0 {
-            val -= 0.4 * plan.target_dist[v] * out.units[ME][v] as f64;
         }
     }
 
@@ -243,7 +303,7 @@ fn tri_state(g: &Game) -> (Vec<i8>, Vec<[bool; 2]>) {
     (g.tris.iter().map(|t| t.owner).collect(), g.tris.iter().map(|t| t.can).collect())
 }
 
-fn play_turn(g: &mut Game, rng: &mut Rng, start: Instant, budget: u128) -> String {
+fn play_turn(g: &mut Game, rng: &mut Rng, budget: &mut Budget) -> String {
     let mut cmds: Vec<String> = Vec::new();
     let (mut owner, mut can) = tri_state(g);
 
@@ -258,7 +318,7 @@ fn play_turn(g: &mut Game, rng: &mut Rng, start: Instant, budget: u128) -> Strin
         for &c in &t.c {
             for &w in g.adj[c].iter() {
                 let k = g.units[OP][w];
-                if k >= 3 && best.map_or(true, |(bk, _)| k > bk) {
+                if k >= param("CG_ATTACK_MIN", 3) && best.map_or(true, |(bk, _)| k > bk) {
                     best = Some((k, w));
                 }
             }
@@ -284,19 +344,25 @@ fn play_turn(g: &mut Game, rng: &mut Rng, start: Instant, budget: u128) -> Strin
         }
     }
     let mut dest = origin.clone();
+    let assigned = assign_targets(g, &origin, &owner, &can);
     let score_of = |dest: &[usize]| -> f64 {
         let mut mine = vec![0i32; g.n];
-        for &d in dest {
+        let mut shaping = 0.0;
+        for (u, &d) in dest.iter().enumerate() {
             mine[d] += 1;
+            shaping += match assigned[u] {
+                Some(c) => 0.8 * g.dist[d][c] as f64,
+                None => 0.4 * plan.target_dist[d],
+            };
         }
         let out = resolve(g, [mine, g.units[OP].clone()], owner.clone(), can.clone());
-        evaluate(g, &plan, &out)
+        evaluate(g, &plan, &out) - shaping
     };
     let mut best = score_of(&dest);
     if !origin.is_empty() {
         // Coordinate descent, then random pair moves for coordinated captures.
         let mut improved = true;
-        while improved && start.elapsed().as_millis() < budget {
+        while improved && !budget.spent() {
             improved = false;
             for u in 0..origin.len() {
                 let keep = dest[u];
@@ -319,7 +385,7 @@ fn play_turn(g: &mut Game, rng: &mut Rng, start: Instant, budget: u128) -> Strin
                 }
             }
         }
-        while start.elapsed().as_millis() < budget {
+        while !budget.spent() {
             let a = rng.below(origin.len());
             let b = rng.below(origin.len());
             let (ka, kb) = (dest[a], dest[b]);
@@ -360,9 +426,9 @@ fn play_turn(g: &mut Game, rng: &mut Rng, start: Instant, budget: u128) -> Strin
     // Spawns: grow the army while it is small, picking the triangles and corners the evaluation likes best.
     let my_total = origin.len() as i32;
     let op_total = g.total(OP);
-    let cap = (op_total + 2).clamp(8, 40);
-    let mut want = if g.turn < 160 { (cap - my_total).max(0) } else { 0 };
-    let spawn_plan = Plan { target_dist: plan.target_dist.clone(), unit_value: 12.0 };
+    let cap = (op_total + param("CG_SPAWN_LEAD", 2)).clamp(param("CG_SPAWN_MIN", 8), param("CG_SPAWN_MAX", 40));
+    let mut want = if g.turn < param("CG_SPAWN_UNTIL", 160) as usize { (cap - my_total).max(0) } else { 0 };
+    let spawn_plan = Plan { target_dist: plan.target_dist.clone(), unit_value: param("CG_SPAWN_VALUE", 12) as f64 };
     while want > 0 {
         let base = {
             let out = resolve(g, [mine.clone(), g.units[OP].clone()], owner.clone(), can.clone());
@@ -381,7 +447,7 @@ fn play_turn(g: &mut Game, rng: &mut Rng, start: Instant, budget: u128) -> Strin
                 o[i] = NONE;
                 cn[i][ME] = false;
                 let out = resolve(g, [m, g.units[OP].clone()], o, cn);
-                let s = evaluate(g, &spawn_plan, &out) - base;
+                let s = evaluate(g, &spawn_plan, &out) - 0.4 * plan.target_dist[c] - base;
                 if best_spawn.map_or(true, |(bs, _, _)| s > bs) {
                     best_spawn = Some((s, i, c));
                 }
@@ -426,6 +492,7 @@ fn main() {
         dist: Vec::new(),
     };
     let mut rng = Rng(0x9E3779B97F4A7C15);
+    let iters: Option<u64> = std::env::var("CG_ITERS").ok().and_then(|s| s.parse().ok());
     let out = io::stdout();
     loop {
         let s = input.nums();
@@ -462,12 +529,18 @@ fn main() {
             input.nums();
         }
         g.compute_dist();
-        let budget = if g.turn == 0 { FIRST_TURN_BUDGET_MS } else { TURN_BUDGET_MS };
-        let cmd = play_turn(&mut g, &mut rng, start, budget);
+        let ms = if g.turn == 0 { FIRST_TURN_BUDGET_MS } else { TURN_BUDGET_MS };
+        let mut budget = Budget { start, ms, iters, used: 0 };
+        let cmd = play_turn(&mut g, &mut rng, &mut budget);
         eprintln!("turn {} score {}-{} tris {} time {}ms", g.turn, g.score[0], g.score[1], g.tris.len(), start.elapsed().as_millis());
         let mut lock = out.lock();
         writeln!(lock, "{}", cmd).unwrap();
         lock.flush().unwrap();
         g.turn += 1;
     }
+}
+
+/// Tuning knob read from the environment for local experiments; CodinGame always gets the default.
+fn param(name: &str, default: i32) -> i32 {
+    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }
