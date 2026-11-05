@@ -17,6 +17,9 @@ for i in $(seq 0 $((GAMES - 1))); do
       | cg -X POST "$API/test-games" -H 'Content-Type: application/json' --data-binary @-)
     TID=$(jq -r '.test_game_id // empty' <<< "$R" 2>/dev/null)
     [ -n "$TID" ] && break
+    if [ "$(jq -r '.code // empty' <<< "$R" 2>/dev/null)" = INVALID_OPPONENT ]; then
+      echo "$agent is no longer a valid opponent, skipping" >&2; continue 2
+    fi
     wait_s=$(jq -r '.retry_after_seconds // .limits.test_games.resets_in_seconds // 30' <<< "$R" 2>/dev/null || echo 30)
     echo "waiting ${wait_s}s ($(jq -r '.title // .type // "limit"' <<< "$R" 2>/dev/null))" >&2
     sleep "$wait_s"

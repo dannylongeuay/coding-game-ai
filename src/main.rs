@@ -102,6 +102,7 @@ struct Outcome {
     units: [Vec<i32>; 2],
     node_owner: Vec<i8>,
     tri_owner: Vec<i8>,
+    tri_can: Vec<[bool; 2]>,
 }
 
 fn node_owners(adj: &[Vec<usize>], units: &[Vec<i32>; 2]) -> Vec<i8> {
@@ -180,6 +181,7 @@ fn resolve(g: &Game, units: [Vec<i32>; 2], tri_owner: Vec<i8>, tri_can: Vec<[boo
         units,
         node_owner,
         tri_owner,
+        tri_can,
     }
 }
 
@@ -337,6 +339,33 @@ fn evaluate(g: &Game, plan: &Plan, out: &Outcome) -> f64 {
             val += if p == ME { 1.0 } else { -1.0 } * w.expose * best;
         }
     }
+
+    // Triangles one corner away from a capture next turn.
+    if w.prep > 0.0 {
+        for (i, t) in g.tris.iter().enumerate() {
+            for p in [ME, OP] {
+                if out.tri_owner[i] == p as i8 || !out.tri_can[i][p] {
+                    continue;
+                }
+                let owned = t.c.iter().filter(|&&c| out.node_owner[c] == p as i8).count();
+                if owned == 2 {
+                    val += if p == ME { w.prep } else { -w.prep };
+                }
+            }
+        }
+    }
+
+    // Triangles we used and cannot retake until our units leave every corner.
+    if w.vacate > 0.0 {
+        for (i, t) in g.tris.iter().enumerate() {
+            if out.tri_owner[i] == NONE
+                && !out.tri_can[i][ME]
+                && t.c.iter().any(|&c| out.units[ME][c] > 0)
+            {
+                val -= w.vacate;
+            }
+        }
+    }
     val
 }
 
@@ -405,16 +434,33 @@ fn score_vs(
         .sum()
 }
 
-/// Chooses a destination (stay or a neighbor) for each of our units. Returns (origin, destination) per unit and the plan's score.
+/// Triangles we may spawn from this turn, searched together with the moves.
+struct Spawns {
+    tris: Vec<usize>,
+    /// Most spawns allowed this turn.
+    max: usize,
+    /// Extra value of a spawned unit on top of the evaluation's unit value.
+    bonus: f64,
+}
+
+/// A planned turn: (origin, destination) per unit and the corner chosen per spawnable triangle.
+struct Choice {
+    origin: Vec<usize>,
+    dest: Vec<usize>,
+    spawn: Vec<Option<usize>>,
+}
+
+/// Chooses a destination (stay or a neighbor) for each of our units and which triangles to spawn from.
 fn plan_moves(
     g: &Game,
     plan: &Plan,
     owner: &[i8],
     can: &[[bool; 2]],
     scenarios: &[(f64, Vec<i32>)],
+    spawns: &Spawns,
     rng: &mut Rng,
     budget: &mut Budget,
-) -> (Vec<usize>, Vec<usize>, f64) {
+) -> Choice {
     let mut origin: Vec<usize> = Vec::new();
     for v in 0..g.n {
         for _ in 0..g.units[ME][v] {
@@ -422,6 +468,7 @@ fn plan_moves(
         }
     }
     let mut dest = origin.clone();
+    let mut spawn: Vec<Option<usize>> = vec![None; spawns.tris.len()];
     let assigned = assign_targets(g, &origin, owner, can);
     if std::env::var("CG_DEBUG").is_ok() {
         eprintln!(
@@ -434,7 +481,7 @@ fn plan_moves(
                 .count()
         );
     }
-    let score_of = |dest: &[usize]| -> f64 {
+    let score_of = |dest: &[usize], spawn: &[Option<usize>]| -> f64 {
         let mut mine = vec![0i32; g.n];
         let mut shaping = 0.0;
         for (u, &d) in dest.iter().enumerate() {
@@ -444,76 +491,130 @@ fn plan_moves(
                 None => 0.4 * plan.target_dist[d],
             };
         }
-        score_vs(g, plan, owner, can, &mine, scenarios) - shaping
+        let count = spawn.iter().filter(|s| s.is_some()).count();
+        if count == 0 {
+            return score_vs(g, plan, owner, can, &mine, scenarios) - shaping;
+        }
+        if count > spawns.max {
+            return f64::NEG_INFINITY;
+        }
+        let mut o = owner.to_vec();
+        let mut cn = can.to_vec();
+        for (k, s) in spawn.iter().enumerate() {
+            if let Some(c) = *s {
+                let i = spawns.tris[k];
+                mine[c] += 1;
+                o[i] = NONE;
+                cn[i][ME] = false;
+                shaping += 0.4 * plan.target_dist[c];
+            }
+        }
+        score_vs(g, plan, &o, &cn, &mine, scenarios) + spawns.bonus * count as f64 - shaping
     };
-    let mut best = score_of(&dest);
-    if origin.is_empty() {
-        return (origin, dest, best);
+    let mut best = score_of(&dest, &spawn);
+    let genes = origin.len() + spawn.len();
+    if genes == 0 {
+        return Choice { origin, dest, spawn };
     }
-    // Coordinate descent, then random pair moves for coordinated captures.
+    // Options for gene k: a unit's stay-or-neighbor moves, or a triangle's no-spawn-or-corner.
+    let options = |k: usize| -> Vec<Option<usize>> {
+        if k < origin.len() {
+            std::iter::once(origin[k])
+                .chain(g.adj[origin[k]].iter().copied())
+                .map(Some)
+                .collect()
+        } else {
+            std::iter::once(None)
+                .chain(g.tris[spawns.tris[k - origin.len()]].c.iter().copied().map(Some))
+                .collect()
+        }
+    };
+    let n_units = origin.len();
+    let get = |dest: &[usize], spawn: &[Option<usize>], k: usize| {
+        if k < n_units {
+            Some(dest[k])
+        } else {
+            spawn[k - n_units]
+        }
+    };
+    let set = |dest: &mut Vec<usize>, spawn: &mut Vec<Option<usize>>, k: usize, v: Option<usize>| {
+        if k < n_units {
+            dest[k] = v.unwrap();
+        } else {
+            spawn[k - n_units] = v;
+        }
+    };
+    let opts: Vec<Vec<Option<usize>>> = (0..genes).map(options).collect();
+    // Coordinate descent, then random pair changes for coordinated captures.
     let mut improved = true;
     while improved && !budget.spent() {
         improved = false;
-        for u in 0..origin.len() {
-            let keep = dest[u];
-            let options: Vec<usize> = std::iter::once(origin[u])
-                .chain(g.adj[origin[u]].iter().copied())
-                .collect();
-            for o in options {
+        for k in 0..genes {
+            let keep = get(&dest, &spawn, k);
+            for &o in &opts[k] {
                 if o == keep {
                     continue;
                 }
-                dest[u] = o;
-                let s = score_of(&dest);
+                set(&mut dest, &mut spawn, k, o);
+                let s = score_of(&dest, &spawn);
                 if s > best + 1e-9 {
                     best = s;
                     improved = true;
                     break;
                 }
-                dest[u] = keep;
+                set(&mut dest, &mut spawn, k, keep);
             }
         }
     }
     while !budget.spent() {
-        let a = rng.below(origin.len());
-        let b = rng.below(origin.len());
-        let (ka, kb) = (dest[a], dest[b]);
-        let pick = |rng: &mut Rng, u: usize| {
-            let k = rng.below(g.adj[origin[u]].len() + 1);
-            if k == 0 {
-                origin[u]
-            } else {
-                g.adj[origin[u]][k - 1]
-            }
-        };
-        dest[a] = pick(rng, a);
-        dest[b] = pick(rng, b);
-        let s = score_of(&dest);
+        let a = rng.below(genes);
+        let b = rng.below(genes);
+        let (ka, kb) = (get(&dest, &spawn, a), get(&dest, &spawn, b));
+        let va = opts[a][rng.below(opts[a].len())];
+        set(&mut dest, &mut spawn, a, va);
+        let vb = opts[b][rng.below(opts[b].len())];
+        set(&mut dest, &mut spawn, b, vb);
+        let s = score_of(&dest, &spawn);
         if s >= best {
             best = s;
         } else {
-            dest[a] = ka;
-            dest[b] = kb;
+            set(&mut dest, &mut spawn, b, kb);
+            set(&mut dest, &mut spawn, a, ka);
         }
     }
-    (origin, dest, best)
+    Choice { origin, dest, spawn }
 }
 
 /// Opponent placements to plan against: its units where they stand, and where our planner predicts they go.
 fn scenarios_for(
     g: &Game,
     pred_w: f64,
-    prediction: &Option<Vec<usize>>,
+    prediction: &Option<Vec<i32>>,
 ) -> Vec<(f64, Vec<i32>)> {
     let mut scenarios = vec![(1.0 - pred_w, g.units[OP].clone())];
-    if let Some(s_dest) = prediction {
-        let mut predicted = vec![0i32; g.n];
-        for &d in s_dest {
-            predicted[d] += 1;
-        }
-        scenarios.push((pred_w, predicted));
+    if let Some(predicted) = prediction {
+        scenarios.push((pred_w, predicted.clone()));
     }
     scenarios
+}
+
+/// Unit counts per house after a planned turn: moved units plus spawned ones.
+fn placement(g: &Game, choice: &Choice) -> Vec<i32> {
+    let mut units = vec![0i32; g.n];
+    for &d in &choice.dest {
+        units[d] += 1;
+    }
+    for c in choice.spawn.iter().flatten() {
+        units[*c] += 1;
+    }
+    units
+}
+
+/// Triangles `p` owns and has not used this turn.
+fn spawnable(owner: &[i8], used: &[bool], p: usize) -> Vec<usize> {
+    (0..owner.len())
+        .filter(|&i| owner[i] == p as i8 && !used[i])
+        .collect()
 }
 
 /// The position after we attack `target` from triangle `tri`: one unit spent per corner, the target's opponent units killed.
@@ -579,92 +680,66 @@ fn play_turn(g: &mut Game, rng: &mut Rng, budget: &mut Budget) -> String {
         };
         let mut s_budget = budget.share(param("CG_PRED_SHARE", 33) as u64);
         let static_me = vec![(1.0, sg.units[OP].clone())];
-        let (_, s_dest, _) = plan_moves(
+        let s_spawns = Spawns {
+            tris: spawnable(&s_owner, &vec![false; g.tris.len()], ME),
+            max: param("CG_PRED_SPAWNS", 0) as usize,
+            bonus: spawn_bonus(),
+        };
+        let s_choice = plan_moves(
             &sg,
             &s_plan,
             &s_owner,
             &s_can,
             &static_me,
+            &s_spawns,
             rng,
             &mut s_budget,
         );
-        prediction = Some(s_dest);
+        prediction = Some(placement(&sg, &s_choice));
     }
 
-    // Moves: plan against where the opponent's units are now and where we expect them to go.
+    // Moves and spawns: plan against where the opponent's units are now and where we expect them to go.
+    // Spawn while the army is small, until late in the game.
     let plan = Plan {
         target_dist: target_distances(g),
         unit_value: 4.0,
     };
     let scenarios = scenarios_for(g, pred_w, &prediction);
-    let (origin, dest, _) = plan_moves(g, &plan, &owner, &can, &scenarios, rng, budget);
+    let my_total = g.total(ME);
+    let op_total = g.total(OP);
+    let cap = (op_total + param("CG_SPAWN_LEAD", 50))
+        .clamp(param("CG_SPAWN_MIN", 8), param("CG_SPAWN_MAX", 100));
+    let want = if g.turn < param("CG_SPAWN_UNTIL", 160) as usize {
+        (cap - my_total).max(0) as usize
+    } else {
+        0
+    };
+    let spawns = Spawns {
+        tris: if want > 0 { spawnable(&owner, &used, ME) } else { Vec::new() },
+        max: want,
+        bonus: spawn_bonus(),
+    };
+    let choice = plan_moves(g, &plan, &owner, &can, &scenarios, &spawns, rng, budget);
 
     let mut moves: Vec<((usize, usize), i32)> = Vec::new();
-    for (u, &d) in dest.iter().enumerate() {
-        if d == origin[u] {
+    for (u, &d) in choice.dest.iter().enumerate() {
+        let from = choice.origin[u];
+        if d == from {
             continue;
         }
-        match moves.iter_mut().find(|(k, _)| *k == (origin[u], d)) {
+        match moves.iter_mut().find(|(k, _)| *k == (from, d)) {
             Some((_, cnt)) => *cnt += 1,
-            None => moves.push(((origin[u], d), 1)),
+            None => moves.push(((from, d), 1)),
         }
     }
     for ((from, to), cnt) in &moves {
         cmds.push(format!("MOVE {} {} {}", from, to, cnt));
     }
-    let mut mine = vec![0i32; g.n];
-    for &d in &dest {
-        mine[d] += 1;
-    }
-
-    // Spawns: grow the army while it is small, picking the triangles and corners the evaluation likes best.
-    let my_total = origin.len() as i32;
-    let op_total = g.total(OP);
-    let cap = (op_total + param("CG_SPAWN_LEAD", 2))
-        .clamp(param("CG_SPAWN_MIN", 8), param("CG_SPAWN_MAX", 40));
-    let mut want = if g.turn < param("CG_SPAWN_UNTIL", 160) as usize {
-        (cap - my_total).max(0)
-    } else {
-        0
-    };
-    let spawn_plan = Plan {
-        target_dist: plan.target_dist.clone(),
-        unit_value: param("CG_SPAWN_VALUE", 12) as f64,
-    };
-    while want > 0 {
-        let base = score_vs(g, &spawn_plan, &owner, &can, &mine, &scenarios);
-        let mut best_spawn: Option<(f64, usize, usize)> = None;
-        for i in 0..g.tris.len() {
-            if used[i] || g.tris[i].owner != ME as i8 {
-                continue;
-            }
-            for &c in &g.tris[i].c {
-                let mut m = mine.clone();
-                m[c] += 1;
-                let mut o = owner.clone();
-                let mut cn = can.clone();
-                o[i] = NONE;
-                cn[i][ME] = false;
-                let s = score_vs(g, &spawn_plan, &o, &cn, &m, &scenarios)
-                    - 0.4 * plan.target_dist[c]
-                    - base;
-                if best_spawn.map_or(true, |(bs, _, _)| s > bs) {
-                    best_spawn = Some((s, i, c));
-                }
-            }
-        }
-        match best_spawn {
-            Some((s, i, c)) if s > 0.0 => {
-                let t = &g.tris[i];
-                let others: Vec<usize> = t.c.iter().copied().filter(|&x| x != c).collect();
-                cmds.push(format!("SPAWN {} {} {}", c, others[0], others[1]));
-                mine[c] += 1;
-                owner[i] = NONE;
-                can[i][ME] = false;
-                used[i] = true;
-                want -= 1;
-            }
-            _ => break,
+    for (k, s) in choice.spawn.iter().enumerate() {
+        if let Some(c) = *s {
+            let t = &g.tris[spawns.tris[k]];
+            let others: Vec<usize> = t.c.iter().copied().filter(|&x| x != c).collect();
+            cmds.push(format!("SPAWN {} {} {}", c, others[0], others[1]));
         }
     }
 
@@ -782,6 +857,8 @@ struct Weights {
     assign: f64,
     expose: f64,
     expose_tri: f64,
+    prep: f64,
+    vacate: f64,
 }
 
 fn weights() -> &'static Weights {
@@ -791,5 +868,12 @@ fn weights() -> &'static Weights {
         assign: param("CG_ASSIGN_W", 20) as f64 / 10.0,
         expose: param("CG_EXPOSE_W", 0) as f64 / 10.0,
         expose_tri: param("CG_EXPOSE_TRI", 50) as f64 / 10.0,
+        prep: param("CG_PREP_W", 30) as f64 / 10.0,
+        vacate: param("CG_VACATE_W", 10) as f64 / 10.0,
     })
+}
+
+/// Value of a spawned unit beyond the evaluation's unit value (CG_SPAWN_VALUE minus 4).
+fn spawn_bonus() -> f64 {
+    param("CG_SPAWN_VALUE", 12) as f64 - 4.0
 }

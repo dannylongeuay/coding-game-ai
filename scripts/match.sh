@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Plays bot A against bot B on the local referee, each seed twice with swapped seats.
-# Usage: scripts/match.sh <botA> <botB> [games=20] [jobs=8] [league=2]
+# Usage: scripts/match.sh <botA> <botB> [games=20] [jobs=8] [league=3]
 # Run inside `nix develop`. Needs ./referee built (see README).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-A=$(realpath "$1"); B=$(realpath "$2"); GAMES=${3:-20}; JOBS=${4:-8}; LEAGUE=${5:-2}
+A=$(realpath "$1"); B=$(realpath "$2"); GAMES=${3:-20}; JOBS=${4:-8}; LEAGUE=${5:-3}
 CP="referee/target/classes:referee/target/test-classes:$(cat referee/cp.txt)"
 OUT=$(mktemp -d)
 
